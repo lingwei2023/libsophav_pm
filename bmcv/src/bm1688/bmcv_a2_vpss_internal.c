@@ -9,7 +9,7 @@
 #include <sys/ioctl.h>
 #endif
 
-#define VPSS_TIMEOUT_MS 1000
+#define MIN_VPSS_TIMEOUT_MS 2
 
 #define bm_min(x, y) (((x)) < ((y)) ? (x) : (y))
 #define bm_max(x, y) (((x)) > ((y)) ? (x) : (y))
@@ -916,6 +916,14 @@ bm_status_t bm_vpss_set_convertto(bmcv_convert_to_attr convertto_attr, struct vp
 	return BM_SUCCESS;
 }
 
+bm_status_t bm_vpss_chn_set_circle(bmcv_circle_cfg *circle_attr, bm_vpss_cfg *vpss_cfg) {
+	// borrowing unused structures to maintain compatibility with the previous ioctl
+	vpss_cfg->chn_attr.chn_attr.frame_rate.src_frame_rate = circle_attr->cfg0.raw;
+	vpss_cfg->chn_attr.chn_attr.frame_rate.dst_frame_rate = circle_attr->cfg1.raw;
+	vpss_cfg->chn_attr.chn_attr.video_format = circle_attr->radius;
+	return BM_SUCCESS;
+}
+
 bm_status_t bm_vpss_chn_set_gop(bmcv_rgn_cfg* gop_attr, struct rgn_cfg *cfg) {
 	unsigned char layer_num = (gop_attr->rgn_num + 7) >> 3;
 	unsigned char gop_num = 0;
@@ -925,14 +933,6 @@ bm_status_t bm_vpss_chn_set_gop(bmcv_rgn_cfg* gop_attr, struct rgn_cfg *cfg) {
 		for (int j = 0; j < gop_num; j++)
 			cfg[i].param[j] = gop_attr->param[(i * 8 + j)];
 	}
-	return BM_SUCCESS;
-}
-
-bm_status_t bm_vpss_chn_set_circle(bmcv_circle_cfg *circle_attr, bm_vpss_cfg *vpss_cfg) {
-	// borrowing unused structures to maintain compatibility with the previous ioctl
-	vpss_cfg->chn_attr.chn_attr.frame_rate.src_frame_rate = circle_attr->cfg0.raw;
-	vpss_cfg->chn_attr.chn_attr.frame_rate.dst_frame_rate = circle_attr->cfg1.raw;
-	vpss_cfg->chn_attr.chn_attr.video_format = circle_attr->radius;
 	return BM_SUCCESS;
 }
 
@@ -1043,6 +1043,14 @@ static void* vpss_thread(void* arg){
 		if (ctx->ret == BM_SUCCESS) break;
 	}
 	return 0;
+}
+
+int get_env_int(const char* env_name, int default_value) {
+    const char* value = getenv(env_name);
+    if (value != NULL && value[0] != '\0') {
+        return atoi(value);
+    }
+    return default_value;
 }
 
 bm_status_t bm_vpss_asic(
@@ -1165,7 +1173,7 @@ bm_status_t bm_vpss_asic(
 		}
 
 		if (convert_to_attr != NULL)
-			bm_vpss_set_convertto(convert_to_attr[0], &ctx[i].vpss_cfg.chn_convert_cfg);
+			bm_vpss_set_convertto(convert_to_attr[i], &ctx[i].vpss_cfg.chn_convert_cfg);
 
 		if (border_param != NULL && border_param[i].border_num > 0)
 			bm_vpss_set_chn_draw_rect(border_param + i, &ctx[i].vpss_cfg.chn_draw_rect_cfg);
@@ -1181,9 +1189,13 @@ bm_status_t bm_vpss_asic(
 		if (circle_attr != NULL && circle_attr->cfg0.b.enable)
 			bm_vpss_chn_set_circle(circle_attr, &ctx[i].vpss_cfg);
 
-		bm_send_image_frame(input[i], &ctx[i].vpss_cfg.snd_frm_cfg.video_frame, ctx[i].vpss_cfg.grp_attr.grp_attr.pixel_format);
+bm_send_image_frame(input[i], &ctx[i].vpss_cfg.snd_frm_cfg.video_frame, ctx[i].vpss_cfg.grp_attr.grp_attr.pixel_format);
 
-		ctx[i].vpss_cfg.chn_frm_cfg.milli_sec = VPSS_TIMEOUT_MS;
+		int input_pixnum = input[i].width * input[i].height;
+		int output_pixnum = output[i].width * output[i].height;
+		int time_est_ms = BM_MAX(input_pixnum, output_pixnum) / 650000;
+
+		ctx[i].vpss_cfg.chn_frm_cfg.milli_sec = get_env_int("VPSS_TIMEOUT_MS", BM_MAX((time_est_ms * 3), MIN_VPSS_TIMEOUT_MS));
 	}
 	if (frame_number > 1) {
 		pthread_t pid[frame_number];
@@ -1213,7 +1225,7 @@ bm_status_t bm_vpss_asic(
 #endif
 		}
 		if (ctx[i].ret != BM_SUCCESS) {
-			bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "ret(%d), bm_send_frame fail\n", ctx[i].ret);
+			bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "ret(0x%lx), bm_send_frame fail\n", (unsigned long)ret);
 		}
 		ret |= ctx[i].ret;
 	}
@@ -1321,6 +1333,7 @@ bm_status_t bm_vpss_multi_parameter_processing(
 	for (i = 0; i < frame_number; i++) {
 		in_need_copy[i] = is_need_width_align_input(input[i]);
 		if (in_need_copy[i]) {
+#ifndef BM_PCIE_MODE
 			int src_stride[3];
 			int align_stride[3];
 			bm_image_get_stride(input[i], src_stride);
@@ -1348,6 +1361,12 @@ bm_status_t bm_vpss_multi_parameter_processing(
 					"bmcv_width_align in fail %s: %s: %d\n", __FILE__, __func__, __LINE__);
 				goto fail;
 			}
+#else
+			bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR,
+				"input fmt(%d) align not support %s: %s: %d\n",
+				input[i].image_format, __FILE__, __func__, __LINE__);
+			goto fail;
+#endif
 		} else
 			in_align[i] = input[i];
 	}
@@ -1397,8 +1416,6 @@ fail:
 		if (in_need_copy[i])
 			bm_image_destroy(in_align + i);
 		if (out_need_alloc[i])
-			bm_image_detach(out_align[i]);
-		if (out_need_create[i])
 			bm_image_destroy(out_align + i);
 	}
 	return ret;

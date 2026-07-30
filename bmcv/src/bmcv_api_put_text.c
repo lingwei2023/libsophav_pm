@@ -25,7 +25,6 @@ typedef struct {
     uint8_t r; // Red
     uint8_t a; // Alpha
 } ARGB8888;
-
 struct bmPoint2l {
     int64 x;
     int64 y;
