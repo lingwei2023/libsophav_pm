@@ -514,7 +514,7 @@ BmJpuDecReturnCodes bm_jpu_jpeg_dec_open(BmJpuJPEGDecoder **jpeg_decoder,
 
     *jpeg_decoder = (BmJpuJPEGDecoder *)malloc(sizeof(BmJpuJPEGDecoder));
     (*jpeg_decoder)->device_index = open_params->device_index;  // soc_idx
-    (*jpeg_decoder)->decoder = (BmJpuDecoder *)malloc(sizeof(BmJpuDecoder));
+    (*jpeg_decoder)->decoder = (BmJpuDecoder *)calloc(1, sizeof(BmJpuDecoder));
     (*jpeg_decoder)->decoder->device_index = open_params->device_index;
     (*jpeg_decoder)->decoder->channel_id = chn_id;
     bm_jpu_dec_set_interrupt_timeout((*jpeg_decoder)->decoder, open_params->timeout);
