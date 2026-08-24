@@ -3602,6 +3602,8 @@ static bm_status_t bm_dwa_basic(bm_handle_t handle,
                                 void *ptr){
 
     s32 fd = 0;
+    bool job_submitted = false;
+    bool inflight_held = false;
 
     s32 ret = bm_get_dwa_fd(&fd);
     if (ret != BM_SUCCESS) {
@@ -3609,10 +3611,19 @@ static bm_status_t bm_dwa_basic(bm_handle_t handle,
         return BM_ERR_DEVNOTREADY;
     }
 
+    ret = (s32)bmcv_ldc_inflight_acquire();
+    if (ret != BM_SUCCESS) {
+        bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR,
+                  "bmcv_ldc_inflight_acquire failed (ret=%d)\n", ret);
+        return (bm_status_t)ret;
+    }
+    inflight_held = true;
+
     ret = bm_dwa_send_frame(fd, &input_image, &output_image, param);
     if (ret != BM_SUCCESS) {
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "bm_dwa_send_frame failed!\n");
-        return BM_ERR_FAILURE;
+        ret = BM_ERR_FAILURE;
+        goto fail;
     }
 
     // ret = bm_dwa_init(fd);
@@ -3646,6 +3657,7 @@ static bm_status_t bm_dwa_basic(bm_handle_t handle,
     if (ret != BM_SUCCESS) {
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "BM_DWA_EndJob failed!\n");
         ret = BM_ERR_FAILURE;
+        job_submitted = true;
         goto fail;
     }
 
@@ -3660,15 +3672,25 @@ static bm_status_t bm_dwa_basic(bm_handle_t handle,
     if (ret != BM_SUCCESS) {
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "bm_dwa_get_frame failed!\n");
         ret = BM_ERR_FAILURE;
+        job_submitted = true;
         goto fail;
     }
 
+    if (inflight_held) {
+        bmcv_ldc_inflight_release();
+        inflight_held = false;
+    }
+    return BM_SUCCESS;
+
 fail:
     if (ret) {
-        if (param->hHandle) {
-            ret |= bm_dwa_cancel_job(fd, param->hHandle);
+        if (param->hHandle && !job_submitted) {
+            bm_dwa_cancel_job(fd, param->hHandle);
         }
+        param->hHandle = 0;
     }
+    if (inflight_held)
+        bmcv_ldc_inflight_release();
     return ret;
 }
 

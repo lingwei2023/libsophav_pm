@@ -6,6 +6,8 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <semaphore.h>
+#include <time.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -1087,7 +1089,99 @@ u8 is_yuv420_image(bm_image_format_ext image_format){
 		return 0;
 }
 
-static int mem_fd = -1, vpss_fd = -1, dpu_fd = -1, dwa_fd = -1, ldc_fd = -1;
+static int mem_fd = -1, vpss_fd = -1, dpu_fd = -1, soph_ldc_fd = -1;
+
+#define BMCV_LDC_INFLIGHT_MAX     4
+#define BMCV_LDC_INFLIGHT_SEM     "/sophon_ldc_dwa_inflight"
+
+static sem_t *g_ldc_inflight_sem;
+static pthread_mutex_t g_ldc_inflight_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_ldc_inflight_held;
+static int g_ldc_inflight_atexit_reg;
+
+static void bmcv_ldc_inflight_atexit(void)
+{
+	/* Return slots held by this process so SIGINT/normal exit does not
+	 * permanently drain the named semaphore (kernel does not undo it).
+	 */
+	while (g_ldc_inflight_held > 0 &&
+	       g_ldc_inflight_sem && g_ldc_inflight_sem != SEM_FAILED) {
+		sem_post(g_ldc_inflight_sem);
+		g_ldc_inflight_held--;
+	}
+}
+
+static bm_status_t bmcv_ldc_inflight_init(void)
+{
+	pthread_mutex_lock(&g_ldc_inflight_init_lock);
+	if (!g_ldc_inflight_sem)
+		g_ldc_inflight_sem = sem_open(BMCV_LDC_INFLIGHT_SEM, O_CREAT, 0666,
+					      BMCV_LDC_INFLIGHT_MAX);
+	if (g_ldc_inflight_sem != SEM_FAILED && !g_ldc_inflight_atexit_reg) {
+		atexit(bmcv_ldc_inflight_atexit);
+		g_ldc_inflight_atexit_reg = 1;
+	}
+	pthread_mutex_unlock(&g_ldc_inflight_init_lock);
+
+	if (g_ldc_inflight_sem == SEM_FAILED) {
+		BMCV_ERR_LOG("sem_open %s fail: %s\n", BMCV_LDC_INFLIGHT_SEM,
+			     strerror(errno));
+		return BM_ERR_DEVNOTREADY;
+	}
+	return BM_SUCCESS;
+}
+
+bm_status_t bmcv_ldc_inflight_acquire(void)
+{
+	struct timespec ts;
+	bm_status_t ret;
+	int waited_sec = 0;
+
+	ret = bmcv_ldc_inflight_init();
+	if (ret != BM_SUCCESS)
+		return ret;
+
+	/* Block until a slot is free. Never return BUSY to the application;
+	 * excess threads are queued here. Warn after 10s — usually means a
+	 * previous crash left the named semaphore drained (value == 0).
+	 */
+	for (;;) {
+		if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+			return BM_ERR_DEVNOTREADY;
+		ts.tv_sec += 1;
+
+		if (sem_timedwait(g_ldc_inflight_sem, &ts) == 0) {
+			__sync_fetch_and_add(&g_ldc_inflight_held, 1);
+			return BM_SUCCESS;
+		}
+		if (errno == EINTR)
+			continue;
+		if (errno != ETIMEDOUT) {
+			BMCV_ERR_LOG("sem_timedwait %s fail: %s\n",
+				     BMCV_LDC_INFLIGHT_SEM, strerror(errno));
+			return BM_ERR_DEVNOTREADY;
+		}
+		waited_sec++;
+		if (waited_sec == 10) {
+			int val = -1;
+
+			sem_getvalue(g_ldc_inflight_sem, &val);
+			bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_WARNING,
+				  "LDC/DWA inflight wait >10s (sem_val=%d). "
+				  "If no other LDC client is running, clear stale "
+				  "slots: rm -f /dev/shm/sem.sophon_ldc_dwa_inflight\n",
+				  val);
+		}
+	}
+}
+
+void bmcv_ldc_inflight_release(void)
+{
+	if (g_ldc_inflight_sem && g_ldc_inflight_sem != SEM_FAILED) {
+		sem_post(g_ldc_inflight_sem);
+		__sync_fetch_and_sub(&g_ldc_inflight_held, 1);
+	}
+}
 static int mem_use_num = 0;
 bm_status_t bm_get_mem_fd(int* fd){
     bm_status_t ret = BM_SUCCESS;
@@ -1137,34 +1231,23 @@ bm_status_t bm_get_dpu_fd(int* fd){
     return ret;
 };
 
-bm_status_t bm_get_dwa_fd(int* fd){
+bm_status_t bm_get_ldc_fd(int* fd){
     bm_status_t ret = BM_SUCCESS;
     pthread_mutex_lock(&fd_mutex);
-    if(dwa_fd < 0)
-        dwa_fd = open("/dev/soph-ldc", O_RDWR /* required */  | O_NONBLOCK | O_CLOEXEC, 0);
+    if(soph_ldc_fd < 0)
+        soph_ldc_fd = open("/dev/soph-ldc", O_RDWR /* required */  | O_NONBLOCK | O_CLOEXEC, 0);
     pthread_mutex_unlock(&fd_mutex);
-    if(dwa_fd < 0){
-        BMCV_ERR_LOG("open dwa fail\n");
+    if(soph_ldc_fd < 0){
+        BMCV_ERR_LOG("open ldc fail\n");
         ret = BM_ERR_DEVNOTREADY;
     } else {
-        *fd = dwa_fd;
+        *fd = soph_ldc_fd;
     }
     return ret;
 };
 
-bm_status_t bm_get_ldc_fd(int* fd){
-    bm_status_t ret = BM_SUCCESS;
-    pthread_mutex_lock(&fd_mutex);
-    if(ldc_fd < 0)
-        ldc_fd = open("/dev/soph-ldc", O_RDWR /* required */  | O_NONBLOCK | O_CLOEXEC, 0);
-    pthread_mutex_unlock(&fd_mutex);
-    if(ldc_fd < 0){
-        BMCV_ERR_LOG("open ldc fail\n");
-        ret = BM_ERR_DEVNOTREADY;
-    } else {
-        *fd = ldc_fd;
-    }
-    return ret;
+bm_status_t bm_get_dwa_fd(int* fd){
+    return bm_get_ldc_fd(fd);
 };
 
 bm_status_t bm_destroy_mem_fd(void){
@@ -1202,21 +1285,15 @@ bm_status_t bm_destroy_dpu_fd(void){
 
 bm_status_t bm_destroy_ldc_fd(void){
     pthread_mutex_lock(&fd_mutex);
-    if(ldc_fd > 0){
-        close(ldc_fd);
-        ldc_fd = -1;
+    if(soph_ldc_fd > 0){
+        close(soph_ldc_fd);
+        soph_ldc_fd = -1;
     }
     pthread_mutex_unlock(&fd_mutex);
     return BM_SUCCESS;
 };
 
 bm_status_t bm_destroy_dwa_fd(void){
-    pthread_mutex_lock(&fd_mutex);
-    if(dwa_fd > 0){
-        close(dwa_fd);
-        dwa_fd = -1;
-    }
-    pthread_mutex_unlock(&fd_mutex);
     return BM_SUCCESS;
 }
 

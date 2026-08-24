@@ -305,6 +305,8 @@ bm_status_t bm_get_ldc_fd(int* fd);
 bm_status_t bm_destroy_ldc_fd(void);
 bm_status_t bm_get_dwa_fd(int* fd);
 bm_status_t bm_destroy_dwa_fd(void);
+bm_status_t bmcv_ldc_inflight_acquire(void);
+void bmcv_ldc_inflight_release(void);
 bm_status_t sg_image_alloc_dev_mem(bm_image image, int heap_id);
 bm_status_t sg_malloc_device_mem(bm_handle_t handle, sg_device_mem_st *pmem, unsigned int size);
 void sg_free_device_mem(bm_handle_t handle, sg_device_mem_st mem);

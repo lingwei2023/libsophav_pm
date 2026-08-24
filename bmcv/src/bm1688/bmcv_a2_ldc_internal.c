@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <stdbool.h>
 #include "bmcv_internal.h"
 #include "bmcv_a2_ldc_internal.h"
 #ifdef __linux__
@@ -15,7 +16,7 @@
 #include <errno.h>
 #endif
 
-bm_meshdata_all ldc_meshdata;
+static pthread_mutex_t s_tsk_mesh_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 bm_tsk_mesh_attr_s tsk_mesh[LDC_MAX_TSK_MESH];
 
@@ -1368,6 +1369,7 @@ bm_status_t mesh_gen_ldc(size_s in_size,
     bm_coord2d_int_hw *src_1st_list = NULL, *src_2nd_list = NULL;
     bm_ldc_attr *cfg = NULL;
     bm_ldc_rgn_attr *rgn_attr = NULL;
+    bm_meshdata_all ldc_meshdata = {0};
 
     (void)mesh_phy_addr;
     (void)rot;
@@ -1530,6 +1532,15 @@ bm_status_t mesh_gen_ldc(size_s in_size,
     free(cfg);
     free(rgn_attr);
 
+    if (pstLDCAttr->grid_info_attr.enable) {
+        free(ldc_meshdata.pgrid_src);
+        free(ldc_meshdata.pgrid_dst);
+        free(ldc_meshdata.pmesh_src);
+        free(ldc_meshdata.pmesh_dst);
+        free(ldc_meshdata.pnode_src);
+        free(ldc_meshdata.pnode_dst);
+    }
+
     return ret;
 }
 
@@ -1627,8 +1638,10 @@ bm_status_t bm_ldc_gen_gdc_mesh(bm_handle_t handle,
 dump_fail:
 #endif
 
+        pthread_mutex_lock(&s_tsk_mesh_mutex);
         idx = ldc_get_idle_tsk_mesh();
         if (idx >= LDC_MAX_TSK_MESH) {
+            pthread_mutex_unlock(&s_tsk_mesh_mutex);
             bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "tsk mesh count(%d) is out of range(%d)\n", idx + 1, LDC_MAX_TSK_MESH);
             return BM_ERR_FAILURE;
         }
@@ -1636,6 +1649,7 @@ dump_fail:
         strcpy(tsk_mesh[idx].Name, name);
         tsk_mesh[idx].paddr = (uint64_t)dmem.u.device.device_addr;
         tsk_mesh[idx].vaddr = NULL;
+        pthread_mutex_unlock(&s_tsk_mesh_mutex);
 
         // for debug
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_TRACE, "idx in bm_ldc_gen_gdc_mesh for loop = %d\n", idx);
@@ -1702,8 +1716,10 @@ bm_status_t bm_ldc_save_gdc_mesh(bm_handle_t handle,
         }
         free(buffer);
 
+        pthread_mutex_lock(&s_tsk_mesh_mutex);
         idx = ldc_get_idle_tsk_mesh();
         if (idx >= LDC_MAX_TSK_MESH) {
+            pthread_mutex_unlock(&s_tsk_mesh_mutex);
             bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "tsk mesh count(%d) is out of range(%d)\n", idx + 1, LDC_MAX_TSK_MESH);
             return BM_ERR_FAILURE;
         }
@@ -1711,6 +1727,7 @@ bm_status_t bm_ldc_save_gdc_mesh(bm_handle_t handle,
         strcpy(tsk_mesh[idx].Name, name);
         tsk_mesh[idx].paddr = (uint64_t)(*dmem).u.device.device_addr;
         tsk_mesh[idx].vaddr = NULL;
+        pthread_mutex_unlock(&s_tsk_mesh_mutex);
 
         // for debug
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_TRACE, "idx in bm_ldc_save_gdc_mesh = %d\n", idx);
@@ -1750,15 +1767,18 @@ bm_status_t bm_ldc_load_gdc_mesh(bm_handle_t handle,
 
     if (idx >= LDC_MAX_TSK_MESH) {
 
+        pthread_mutex_lock(&s_tsk_mesh_mutex);
         idx = ldc_get_idle_tsk_mesh();      // 0
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_TRACE, "idx = %d \n", idx + 1);
         if (idx >= LDC_MAX_TSK_MESH) {
+            pthread_mutex_unlock(&s_tsk_mesh_mutex);
             bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_TRACE, "tsk mesh count(%d) is out of range(%d)\n", idx + 1, LDC_MAX_TSK_MESH);
             return BM_ERR_FAILURE;
         }
         strcpy(tsk_mesh[idx].Name, tskName);
         tsk_mesh[idx].paddr = (uint64_t)(*dmem).u.device.device_addr;
         tsk_mesh[idx].vaddr = (void*)vaddr;
+        pthread_mutex_unlock(&s_tsk_mesh_mutex);
 
         // for debug
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_TRACE, "idx in bm_ldc_load_gdc_mesh for = %d\n", idx);
@@ -1920,6 +1940,7 @@ static bm_status_t ldc_free_cur_tsk_mesh(char* meshName)
     bm_status_t ret = BM_SUCCESS;
     u8 i = LDC_MAX_TSK_MESH;
 
+    pthread_mutex_lock(&s_tsk_mesh_mutex);
     i = ldc_get_valid_tsk_mesh_by_name2(meshName);
     // for debug
     bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_TRACE, "i in ldc_free_cur_tsk_mesh = %d\n", i);
@@ -1933,6 +1954,7 @@ static bm_status_t ldc_free_cur_tsk_mesh(char* meshName)
         tsk_mesh[i].vaddr = 0;
         memset(tsk_mesh[i].Name, 0, sizeof(tsk_mesh[i].Name));
     }
+    pthread_mutex_unlock(&s_tsk_mesh_mutex);
     return ret;
 }
 
@@ -1944,6 +1966,7 @@ bm_status_t bm_ldc_free_cur_task_mesh(char *tskName)
 bm_status_t bm_ldc_free_all_tsk_mesh(void)
 {
     bm_status_t ret = BM_SUCCESS;
+    pthread_mutex_lock(&s_tsk_mesh_mutex);
     for (u8 i = 0; i < LDC_MAX_TSK_MESH; i++)
     {
         if (tsk_mesh[i].paddr && tsk_mesh[i].vaddr)
@@ -1957,6 +1980,7 @@ bm_status_t bm_ldc_free_all_tsk_mesh(void)
             ret = BM_ERR_PARAM;
         }
     }
+    pthread_mutex_unlock(&s_tsk_mesh_mutex);
     return ret;
 }
 
@@ -2271,23 +2295,31 @@ bm_status_t bm_ldc_basic(bm_handle_t handle,
 {
     bm_status_t ret = BM_SUCCESS;
     int fd = 0;
+    bool job_submitted = false;
+    bool inflight_held = false;
+    bm_device_mem_t mid_mem;
+    memset(&mid_mem, 0, sizeof(mid_mem));
+
     ret = bm_get_ldc_fd(&fd);
     if (ret != BM_SUCCESS) {
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "get ldc fd failed!\n");
         return BM_ERR_DEVNOTREADY;
     }
 
+    ret = bmcv_ldc_inflight_acquire();
+    if (ret != BM_SUCCESS) {
+        bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR,
+                  "bmcv_ldc_inflight_acquire failed (ret=%d)\n", ret);
+        return ret;
+    }
+    inflight_held = true;
+
     memset(&param->stVideoFrameIn, 0, sizeof(param->stVideoFrameIn));
     memset(&param->stVideoFrameOut, 0, sizeof(param->stVideoFrameOut));
 
     ret = bm_ldc_send_frame(fd, &in_image, &out_image, param);
     if (ret != BM_SUCCESS)
-       return ret;
-
-    // Init LDC
-    // ret = bm_ldc_init(fd);
-    // if (ret != BM_SUCCESS)
-    //    return ret;
+       goto fail0;
 
     param->hHandle = 0;
 
@@ -2299,7 +2331,6 @@ bm_status_t bm_ldc_basic(bm_handle_t handle,
     if (ret != BM_SUCCESS)
        goto fail0;
 
-    bm_device_mem_t mid_mem;
     unsigned int dem_size = 0;
     if (param->op == BM_LDC_GDC || param->op == BM_LDC_GDC_LOAD_MESH)
     {
@@ -2317,7 +2348,7 @@ bm_status_t bm_ldc_basic(bm_handle_t handle,
 
         if (ret != BM_SUCCESS) {
             bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "bm_malloc_device_byte failed: %s\n", strerror(errno));
-            goto fail1;
+            goto fail0;
         }
     }
 
@@ -2330,39 +2361,42 @@ bm_status_t bm_ldc_basic(bm_handle_t handle,
     }
 
     ret = bm_ldc_end_job(fd, param->hHandle);
-    if (ret != BM_SUCCESS)
+    if (ret != BM_SUCCESS) {
+        job_submitted = true;
         goto fail2;
+    }
 
     if (param->op == BM_LDC_ROT || param->op == BM_LDC_GDC || param->op == BM_LDC_GDC_LOAD_MESH) {
         ret = bm_ldc_get_frame(fd, &out_image, param);
-        if (ret != BM_SUCCESS)
-        goto fail2;
+        if (ret != BM_SUCCESS) {
+            job_submitted = true;
+            goto fail2;
+        }
     }
 
 fail2:
     if (param->op == BM_LDC_GDC || param->op == BM_LDC_GDC_LOAD_MESH) {
-        ret = bm_ldc_free_cur_task_mesh(param->stTask.name);
+        bm_status_t mesh_ret = bm_ldc_free_cur_task_mesh(param->stTask.name);
         bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_TRACE, "name in bm_ldc_free_cur_task_mesh = %s\n", param->stTask.name);
-        if (ret != BM_SUCCESS) {
+        if (mesh_ret != BM_SUCCESS) {
             bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "bm_ldc_free_cur_task_mesh failed!\n");
+            if (ret == BM_SUCCESS)
+                ret = mesh_ret;
         }
     }
-fail1:
     if (param->op == BM_LDC_GDC || param->op == BM_LDC_GDC_LOAD_MESH) {
         bm_free_device(handle, mid_mem);
     }
 
-    // ret |= bm_ldc_deinit(fd);
-    // if (ret != BM_SUCCESS) {
-    //     bmlib_log(BMCV_LOG_TAG, BMLIB_LOG_ERROR, "bm_ldc_deinit failed!\n");
-    //     return ret;
-    // }
 fail0:
     if (ret) {
-        if (param->hHandle) {
-            ret |= bm_ldc_cancel_job(fd, param->hHandle);
+        if (param->hHandle && !job_submitted) {
+            bm_ldc_cancel_job(fd, param->hHandle);
         }
+        param->hHandle = 0;
     }
+    if (inflight_held)
+        bmcv_ldc_inflight_release();
     return ret;
 }
 
@@ -2472,6 +2506,8 @@ bm_status_t bm_ldc_gdc_internal(bm_handle_t          handle,
                                 bm_image             out_image,
                                 bmcv_gdc_attr        ldc_attr)
 {
+    static volatile unsigned int s_gdc_call_id = 0;
+    unsigned int call_id = __sync_fetch_and_add(&s_gdc_call_id, 1);
     bm_status_t ret = BM_SUCCESS;
     ldc_attr_s ldc_param = {0};
     bm_ldc_basic_param param = {0};
@@ -2499,7 +2535,7 @@ bm_status_t bm_ldc_gdc_internal(bm_handle_t          handle,
     memset(&gdc_with_grid, 0, sizeof(gdc_with_grid));
 
     if (ldc_attr.grid_info.size == 0) {
-        snprintf(param.stTask.name, sizeof(param.stTask.name), "tsk_gdc");      // mesh name
+        snprintf(param.stTask.name, sizeof(param.stTask.name), "tsk_gdc_%u", call_id);      // mesh name
         // snprintf(param.identity.Name, sizeof(param.identity.Name), "job_gdc");
 
         gdc_with_grid.ldc_attr.aspect = ldc_attr.bAspect;
@@ -2512,7 +2548,7 @@ bm_status_t bm_ldc_gdc_internal(bm_handle_t          handle,
         gdc_with_grid.ldc_attr.grid_info_attr.enable = false;
         gdc_with_grid.grid = NULL;
     } else {
-        snprintf(param.stTask.name, sizeof(param.stTask.name), "tsk_gdc_grid_0");
+        snprintf(param.stTask.name, sizeof(param.stTask.name), "tsk_gdc_grid_%u", call_id);
         // snprintf(param.identity.Name, sizeof(param.identity.Name), "job_gdc_grid_0");
 
         gdc_with_grid.ldc_attr.grid_info_attr.enable = true;
